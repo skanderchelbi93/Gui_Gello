@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GELLO Control
+Comment=Launch GELLO Simulation Control Panel
+Exec=python3 /home/pi/Desktop/gello_gui.py
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
