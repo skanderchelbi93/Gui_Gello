@@ -4,13 +4,17 @@ GELLO Simulation Control Panel
 ------------------------------
 Modern dark-themed Tkinter control panel with three columns:
 
-  LEFT   -> Robot arm connection    (Start / Stop / Restart)
-  MIDDLE -> GELLO node + gripper    (Start / Stop)
-  RIGHT  -> Dual GELLO connections  (Start / Stop)
+  LEFT   -> Single robot arm (Left / Right config)  - Start / Stop / Restart
+  MIDDLE -> GELLO node with gripper                 - Start / Stop
+  RIGHT  -> Bimanual (dual arm) GELLO connections    - Start / Stop
+
+All commands run `source .venv/bin/activate && uv run ...` inside
+PROJECT_DIR. Since these are long-running foreground processes with no
+separate stop command, Stop simply terminates the running process, and
+Restart stops then relaunches the same config.
 
 Each column has its OWN log strip showing only the latest line for
-that column's commands. All bash commands are exposed as plain
-variables at the top of the file so you can plug in your real setup.
+that column's commands.
 
 Run:
     python3 gello_gui.py
@@ -25,21 +29,32 @@ import tkinter as tk
 from tkinter import ttk
 
 # =====================================================================
-# 1) EDIT THESE COMMANDS TO MATCH YOUR ENVIRONMENT
+# 1) EDIT THESE TO MATCH YOUR ENVIRONMENT
 # =====================================================================
 
-# ---- LEFT: Robot arm connection -------------------------------------
-CMD_ARM_START = "echo 'Starting robot arm connection...'"
-CMD_ARM_STOP = "echo 'Stopping robot arm connection...'"
-# Restart = stop -> wait -> start (see RESTART_DELAY below)
+# Absolute path to the repo that contains .venv/, experiments/, configs/
+PROJECT_DIR = "/home/pi/gello_software"   # <-- EDIT THIS
 
-# ---- MIDDLE: GELLO node with gripper ---------------------------------
-CMD_GELLO_START = "echo 'Starting GELLO node with gripper...'"
-CMD_GELLO_STOP = "echo 'Stopping GELLO node with gripper...'"
+# Command prefix to activate the uv virtual environment before every run
+ACTIVATE = "source .venv/bin/activate && "
 
-# ---- RIGHT: Dual GELLO connections -----------------------------------
-CMD_GELLO_DUAL_START = "echo 'Starting dual GELLO connections...'"
-CMD_GELLO_DUAL_STOP = "echo 'Stopping dual GELLO connections...'"
+# ---- LEFT: Single arm control (left OR right config, user-selectable) ----
+CMD_ARM_LEFT_START = ACTIVATE + "uv run experiments/launch_yaml.py --left-config-path configs/ur_left.yaml"
+CMD_ARM_RIGHT_START = ACTIVATE + "uv run experiments/launch_yaml.py --left-config-path configs/ur_right.yaml"
+# No separate stop command -> Stop just kills the running process (SIGTERM)
+CMD_ARM_STOP = None
+
+# ---- MIDDLE: GELLO node with gripper --------------------------------------
+CMD_GELLO_GRIPPER_START = ACTIVATE + "uv run experiments/launch_yaml.py --left-config-path configs/ur_right_gripper.yaml"
+CMD_GELLO_GRIPPER_STOP = None
+
+# ---- RIGHT: Bimanual (dual) GELLO control ----------------------------------
+CMD_DUAL_START = (
+    ACTIVATE
+    + "uv run experiments/launch_yaml.py "
+      "--left-config-path configs/ur_left.yaml --right-config-path configs/ur_right.yaml"
+)
+CMD_DUAL_STOP = None
 
 # Delay (seconds) between stop and start when restarting the arm
 RESTART_DELAY = 2.0
@@ -48,22 +63,23 @@ RESTART_DELAY = 2.0
 # 2) THEME
 # =====================================================================
 
-BG = "#0f1420"          # app background
-CARD_BG = "#161c2c"     # column card background
+BG = "#0f1420"
+CARD_BG = "#161c2c"
 CARD_BORDER = "#232b40"
 TEXT_MAIN = "#e7ecf7"
 TEXT_DIM = "#7b869c"
 
-ACCENT_ARM = "#4f8dfd"      # blue
-ACCENT_GELLO = "#33d69f"    # green
-ACCENT_DUAL = "#b285f7"     # purple
-DANGER = "#ff5d73"          # red for stop
-WARN = "#ffb454"            # amber for restart
+ACCENT_ARM = "#4f8dfd"
+ACCENT_GELLO = "#33d69f"
+ACCENT_DUAL = "#b285f7"
+DANGER = "#ff5d73"
+WARN = "#ffb454"
 
-FONT_TITLE = ("Segoe UI Semibold", 15)
-FONT_BTN = ("Segoe UI", 11)
-FONT_LOG = ("Consolas", 9)
-FONT_LOG_LABEL = ("Segoe UI Semibold", 9)
+FONT_TITLE = ("Segoe UI Semibold", 13)
+FONT_BTN = ("Segoe UI", 12, "bold")
+FONT_LOG = ("Consolas", 13, "bold")
+FONT_LOG_LABEL = ("Segoe UI Semibold", 10)
+FONT_SELECTOR = ("Segoe UI", 10)
 
 # =====================================================================
 # 3) PROCESS MANAGER
@@ -71,12 +87,13 @@ FONT_LOG_LABEL = ("Segoe UI Semibold", 9)
 
 
 class ProcessRunner:
-    """Runs bash commands in the background and routes their output
-    into a per-channel queue, so each column can show its own latest
-    log line independently."""
+    """Runs bash commands (in PROJECT_DIR) in the background and routes
+    their output into a per-channel queue, so each column can show its
+    own latest log line independently."""
 
-    def __init__(self):
-        self.processes = {}                 # name -> subprocess.Popen
+    def __init__(self, cwd):
+        self.cwd = cwd
+        self.processes = {}
         self.queues = {"arm": queue.Queue(), "gello": queue.Queue(), "dual": queue.Queue()}
 
     def _stream_output(self, channel, name, proc):
@@ -103,6 +120,7 @@ class ProcessRunner:
             bash_cmd,
             shell=True,
             executable="/bin/bash",
+            cwd=self.cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -120,10 +138,12 @@ class ProcessRunner:
                 q.put(f"[{name}] stop signal sent")
             except Exception as exc:  # noqa: BLE001
                 q.put(f"[{name}] failed to signal process: {exc}")
+        elif not bash_cmd:
+            q.put(f"[{name}] nothing running")
         if bash_cmd:
             self.start(channel, f"{name}-stopcmd", bash_cmd)
 
-    def restart(self, channel, name, stop_cmd, start_cmd, delay=RESTART_DELAY):
+    def restart(self, channel, name, start_cmd, stop_cmd=None, delay=RESTART_DELAY):
         q = self.queues[channel]
 
         def _do_restart():
@@ -136,14 +156,11 @@ class ProcessRunner:
 
 
 # =====================================================================
-# 4) UI HELPERS  (modern flat buttons with hover states)
+# 4) UI HELPERS
 # =====================================================================
 
 
 class ModernButton(tk.Button):
-    """A flat button with a hover-highlight, built on plain tk.Button
-    so we have full color control (ttk themes are limited here)."""
-
     def __init__(self, master, text, base_color, command, icon="", **kwargs):
         self.base_color = base_color
         self.hover_color = self._shade(base_color, 1.15)
@@ -159,8 +176,8 @@ class ModernButton(tk.Button):
             bd=0,
             relief="flat",
             cursor="hand2",
-            padx=14,
-            pady=10,
+            padx=10,
+            pady=7,
             anchor="w",
             justify="left",
             **kwargs,
@@ -183,16 +200,15 @@ def make_card(parent):
     return outer, inner
 
 
-def make_column_log(parent, accent):
-    """A small per-column log strip pinned at the bottom of a card."""
-    wrap = tk.Frame(parent, bg="#0c101b", highlightbackground=accent,
-                     highlightthickness=1)
+def make_column_log(parent, accent, wraplength=230):
+    wrap = tk.Frame(parent, bg="#0c101b", highlightbackground=accent, highlightthickness=2)
     tk.Label(wrap, text="LOG", font=FONT_LOG_LABEL, fg=accent, bg="#0c101b",
-             anchor="w").pack(fill="x", padx=10, pady=(6, 0))
+             anchor="w").pack(fill="x", padx=10, pady=(8, 2))
     var = tk.StringVar(value="idle...")
-    lbl = tk.Label(wrap, textvariable=var, font=FONT_LOG, fg=TEXT_DIM,
-                   bg="#0c101b", anchor="w", justify="left", wraplength=210)
-    lbl.pack(fill="x", padx=10, pady=(2, 8))
+    lbl = tk.Label(wrap, textvariable=var, font=FONT_LOG, fg="#ffffff",
+                   bg="#0c101b", anchor="w", justify="left", wraplength=wraplength,
+                   height=3)
+    lbl.pack(fill="x", padx=10, pady=(2, 10))
     return wrap, var
 
 
@@ -205,12 +221,19 @@ class GelloControlGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("GELLO Simulation Control Panel")
-        self.geometry("980x560")
-        self.minsize(900, 520)
         self.configure(bg=BG)
 
-        self.runner = ProcessRunner()
-        self.log_vars = {}   # channel -> StringVar
+        # Auto-fit to the actual screen (7" Pi touchscreens are ~800x480)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
+        self.minsize(760, 420)
+        # Wider text wrap on bigger screens, tighter on small ones
+        self.col_wrap = max(160, int(screen_w / 3) - 80)
+
+        self.runner = ProcessRunner(cwd=PROJECT_DIR)
+        self.log_vars = {}
+        self.arm_side = tk.StringVar(value="left")  # which single-arm config to use
 
         self._build_header()
         self._build_columns()
@@ -220,9 +243,9 @@ class GelloControlGUI(tk.Tk):
     # ------------------------------------------------------------------
     def _build_header(self):
         header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=28, pady=(24, 6))
+        header.pack(fill="x", padx=14, pady=(8, 4))
 
-        tk.Label(header, text="GELLO Simulation Control", font=("Segoe UI Semibold", 20),
+        tk.Label(header, text="GELLO Simulation Control", font=("Segoe UI Semibold", 15),
                  fg=TEXT_MAIN, bg=BG).pack(side="left")
 
         status = tk.Frame(header, bg=BG)
@@ -230,14 +253,15 @@ class GelloControlGUI(tk.Tk):
         dot = tk.Canvas(status, width=10, height=10, bg=BG, highlightthickness=0)
         dot.create_oval(1, 1, 9, 9, fill="#33d69f", outline="")
         dot.pack(side="left", padx=(0, 6))
-        tk.Label(status, text="Ready", font=("Segoe UI", 10), fg=TEXT_DIM, bg=BG).pack(side="left")
+        tk.Label(status, text=f"Project: {PROJECT_DIR}", font=("Segoe UI", 8),
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
 
-        tk.Frame(self, bg=CARD_BORDER, height=1).pack(fill="x", padx=28, pady=(10, 0))
+        tk.Frame(self, bg=CARD_BORDER, height=1).pack(fill="x", padx=14, pady=(6, 0))
 
     # ------------------------------------------------------------------
     def _build_columns(self):
         board = tk.Frame(self, bg=BG)
-        board.pack(fill="both", expand=True, padx=28, pady=20)
+        board.pack(fill="both", expand=True, padx=10, pady=8)
         for i in range(3):
             board.grid_columnconfigure(i, weight=1, uniform="col")
         board.grid_rowconfigure(0, weight=1)
@@ -246,73 +270,89 @@ class GelloControlGUI(tk.Tk):
         self._build_gello_column(board, 1)
         self._build_dual_column(board, 2)
 
-    # ---------------- LEFT: Robot arm ----------------------------------
+    # ---------------- LEFT: Single robot arm ----------------------------
     def _build_arm_column(self, board, col):
         outer, inner = make_card(board)
-        outer.grid(row=0, column=col, sticky="nsew", padx=10)
+        outer.grid(row=0, column=col, sticky="nsew", padx=5)
         inner.pack_propagate(False)
 
         self._column_header(inner, "🦾", "Robot Arm", ACCENT_ARM)
 
         body = tk.Frame(inner, bg=CARD_BG)
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        ModernButton(body, "Start Arm", ACCENT_ARM, icon="▶",
-                     command=lambda: self.runner.start("arm", "arm", CMD_ARM_START)
-                     ).pack(fill="x", pady=6)
+        # Left / Right config selector
+        sel = tk.Frame(body, bg=CARD_BG)
+        sel.pack(fill="x", pady=(0, 10))
+        tk.Label(sel, text="Config:", font=FONT_SELECTOR, bg=CARD_BG, fg=TEXT_DIM).pack(side="left")
+        for label, value in (("Left", "left"), ("Right", "right")):
+            tk.Radiobutton(
+                sel, text=label, variable=self.arm_side, value=value,
+                font=FONT_SELECTOR, bg=CARD_BG, fg=TEXT_MAIN,
+                selectcolor=CARD_BG, activebackground=CARD_BG,
+                highlightthickness=0, bd=0,
+            ).pack(side="left", padx=6)
+
+        def start_arm():
+            cmd = CMD_ARM_LEFT_START if self.arm_side.get() == "left" else CMD_ARM_RIGHT_START
+            self.runner.start("arm", "arm", cmd)
+
+        def restart_arm():
+            cmd = CMD_ARM_LEFT_START if self.arm_side.get() == "left" else CMD_ARM_RIGHT_START
+            self.runner.restart("arm", "arm", cmd, CMD_ARM_STOP)
+
+        ModernButton(body, "Start Arm", ACCENT_ARM, icon="▶", command=start_arm).pack(fill="x", pady=4)
         ModernButton(body, "Stop Arm", DANGER, icon="■",
-                     command=lambda: self.runner.stop("arm", "arm", CMD_ARM_STOP)
-                     ).pack(fill="x", pady=6)
+                     command=lambda: self.runner.stop("arm", "arm", CMD_ARM_STOP)).pack(fill="x", pady=4)
         ModernButton(body, "Restart (after collision)", WARN, icon="⟳",
-                     command=lambda: self.runner.restart("arm", "arm", CMD_ARM_STOP, CMD_ARM_START)
-                     ).pack(fill="x", pady=6)
+                     command=restart_arm).pack(fill="x", pady=4)
 
-        log_wrap, var = make_column_log(inner, ACCENT_ARM)
-        log_wrap.pack(fill="x", padx=16, pady=(4, 16))
+        log_wrap, var = make_column_log(inner, ACCENT_ARM, self.col_wrap)
+        log_wrap.pack(fill="x", padx=10, pady=(4, 10))
         self.log_vars["arm"] = var
 
     # ---------------- MIDDLE: GELLO + gripper ---------------------------
     def _build_gello_column(self, board, col):
         outer, inner = make_card(board)
-        outer.grid(row=0, column=col, sticky="nsew", padx=10)
+        outer.grid(row=0, column=col, sticky="nsew", padx=5)
         inner.pack_propagate(False)
 
         self._column_header(inner, "🕹️", "GELLO + Gripper", ACCENT_GELLO)
 
         body = tk.Frame(inner, bg=CARD_BG)
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
         ModernButton(body, "Start GELLO", ACCENT_GELLO, icon="▶",
-                     command=lambda: self.runner.start("gello", "gello", CMD_GELLO_START)
-                     ).pack(fill="x", pady=6)
+                     command=lambda: self.runner.start("gello", "gello", CMD_GELLO_GRIPPER_START)
+                     ).pack(fill="x", pady=4)
         ModernButton(body, "Stop GELLO", DANGER, icon="■",
-                     command=lambda: self.runner.stop("gello", "gello", CMD_GELLO_STOP)
-                     ).pack(fill="x", pady=6)
+                     command=lambda: self.runner.stop("gello", "gello", CMD_GELLO_GRIPPER_STOP)
+                     ).pack(fill="x", pady=4)
 
-        log_wrap, var = make_column_log(inner, ACCENT_GELLO)
-        log_wrap.pack(fill="x", padx=16, pady=(4, 16))
+        log_wrap, var = make_column_log(inner, ACCENT_GELLO, self.col_wrap)
+        log_wrap.pack(fill="x", padx=10, pady=(4, 10))
         self.log_vars["gello"] = var
 
-    # ---------------- RIGHT: Dual GELLO ----------------------------------
+    # ---------------- RIGHT: Dual / bimanual GELLO -----------------------
     def _build_dual_column(self, board, col):
         outer, inner = make_card(board)
-        outer.grid(row=0, column=col, sticky="nsew", padx=10)
+        outer.grid(row=0, column=col, sticky="nsew", padx=5)
         inner.pack_propagate(False)
 
         self._column_header(inner, "🔗", "Dual GELLO", ACCENT_DUAL)
 
         body = tk.Frame(inner, bg=CARD_BG)
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
         ModernButton(body, "Start Dual GELLO", ACCENT_DUAL, icon="▶",
-                     command=lambda: self.runner.start("dual", "dual", CMD_GELLO_DUAL_START)
-                     ).pack(fill="x", pady=6)
+                     command=lambda: self.runner.start("dual", "dual", CMD_DUAL_START)
+                     ).pack(fill="x", pady=4)
         ModernButton(body, "Stop Dual GELLO", DANGER, icon="■",
-                     command=lambda: self.runner.stop("dual", "dual", CMD_GELLO_DUAL_STOP)
-                     ).pack(fill="x", pady=6)
+                     command=lambda: self.runner.stop("dual", "dual", CMD_DUAL_STOP)
+                     ).pack(fill="x", pady=4)
 
-        log_wrap, var = make_column_log(inner, ACCENT_DUAL)
-        log_wrap.pack(fill="x", padx=16, pady=(4, 16))
+        log_wrap, var = make_column_log(inner, ACCENT_DUAL, self.col_wrap)
+        log_wrap.pack(fill="x", padx=10, pady=(4, 10))
         self.log_vars["dual"] = var
 
     # ------------------------------------------------------------------
@@ -328,7 +368,6 @@ class GelloControlGUI(tk.Tk):
 
     # ------------------------------------------------------------------
     def _poll_logs(self):
-        """Each column shows only its own latest log line."""
         for channel, q in self.runner.queues.items():
             last_line = None
             try:
